@@ -201,6 +201,22 @@ cleanup_removed_projects() {
     done
 }
 
+# Rewrite already-migrated old-style files in ~/supervisor (in place).
+normalize_legacy_user_files() {
+    local conf tmp
+    [[ -d "${USER_CONF_DIR}" ]] || return 0
+    for conf in "${USER_CONF_DIR}"/*.conf; do
+        [[ -f "${conf}" && -O "${conf}" ]] || continue
+        looks_like_legacy_worker "${conf}" || continue
+        tmp="$(mktemp)"
+        if legacy_to_user_conf "${USER_NAME}" < "${conf}" > "${tmp}" 2>/dev/null; then
+            cat "${tmp}" > "${conf}"
+            echo "  Normalized legacy config: ${conf}"
+        fi
+        rm -f "${tmp}"
+    done
+}
+
 user_scan() {
     USER_NAME="$(whoami)"
     WWW_ROOT="${HOME}/www"
@@ -208,13 +224,14 @@ user_scan() {
 
     echo "=== Scanning projects for user: ${USER_NAME} ==="
 
+    mkdir -p "${USER_CONF_DIR}"
+    normalize_legacy_user_files
+
     if [[ ! -d "${WWW_ROOT}" ]]; then
         echo "No ~/www directory."
-        [[ -d "${USER_CONF_DIR}" ]] && cleanup_removed_projects
+        cleanup_removed_projects
         return 0
     fi
-
-    mkdir -p "${USER_CONF_DIR}"
 
     PHP_BIN=""
     if PHP_BIN="$(resolve_php)"; then
@@ -304,6 +321,67 @@ confd_hash() {
         | cut -d' ' -f1
 }
 
+# True when the file still looks like an old conf.d worker (server-owned keys).
+looks_like_legacy_worker() {
+    grep -qE '^(user|process_name|redirect_stderr|stdout_logfile)=' "$1" 2>/dev/null
+}
+
+# Rewrite an old conf.d-style worker into a clean ~/supervisor file (stdout).
+# Drops user=/process_name=/logging; shortens [program:worker-USER-NAME].
+legacy_to_user_conf() {
+    local usr="$1" line key value name cmd artisan dir
+    local prog="" body="" has_cmd=0 has_dir=0
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        [[ "${line}" =~ ^[[:space:]]*([;#].*)?$ ]] && continue
+
+        if [[ "${line}" =~ ^\[program:([^]]+)\][[:space:]]*$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            name="${name#"worker-${usr}-"}"
+            [[ "${name}" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || return 1
+            prog="${name}"
+            continue
+        fi
+        [[ -n "${prog}" ]] || continue
+        [[ "${line}" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        case "${key}" in
+            user|process_name|redirect_stderr|stdout_*|stderr_*) continue ;;
+            command)
+                body+="command=${value}"$'\n'
+                has_cmd=1
+                cmd="${value}"
+                ;;
+            directory)
+                body+="directory=${value}"$'\n'
+                has_dir=1
+                ;;
+            numprocs|numprocs_start|priority|autostart|autorestart|startsecs|startretries|exitcodes|stopsignal|stopwaitsecs|stopasgroup|killasgroup|environment|umask)
+                body+="${key}=${value}"$'\n'
+                ;;
+        esac
+    done
+
+    [[ -n "${prog}" && "${has_cmd}" -eq 1 ]] || return 1
+
+    # Old templates had no directory=; derive it from the artisan path in command=.
+    if [[ "${has_dir}" -eq 0 ]]; then
+        artisan="$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\/artisan$/) { print $i; exit } }' <<< "${cmd}")"
+        if [[ -n "${artisan}" ]]; then
+            dir="$(dirname "${artisan}")"
+            body="directory=${dir}"$'\n'"${body}"
+        fi
+    fi
+
+    printf '%s\n' "; Migrated from the old conf.d layout. Edit freely."
+    printf '[program:%s]\n' "${prog}"
+    printf '%s' "${body}"
+}
+
 # The worker config written by older versions of this script (users wrote it
 # straight into conf.d). Unedited copies are dropped and regenerated.
 is_legacy_generated() {
@@ -336,7 +414,7 @@ EOF
 # Anything in conf.d not owned by root was written by a site user under the
 # old model. Edited configs move to the owner's ~/supervisor; the rest goes.
 migrate_legacy_confd() {
-    local entry name owner usr
+    local entry name owner usr target cleaned
     for entry in "${CONF_D}"/* "${CONF_D}"/.[!.]*; do
         name="$(basename "${entry}")"
         if [[ -L "${entry}" ]]; then
@@ -351,13 +429,20 @@ migrate_legacy_confd() {
         usr="${UID_NAME[${owner}]:-}"
         if [[ -n "${usr}" && "${name}" == *.conf && "$(stat -c %h "${entry}")" -eq 1 ]] \
             && ! is_empty_conf "${entry}" && ! is_legacy_generated "${entry}" "${usr}"; then
-            if run_as "${usr}" 10 /bin/bash -c \
-                'umask 077; mkdir -p "$HOME/$1" && set -o noclobber && cat > "$HOME/$1/$2"' \
-                _ "${USER_CONF_SUBDIR}" "migrated-${name}" < "${entry}"; then
-                log "Moved edited ${entry} to ~${usr}/${USER_CONF_SUBDIR}/migrated-${name}"
+            target="migrated-${name}"
+            cleaned="$(mktemp)"
+            if legacy_to_user_conf "${usr}" < "${entry}" > "${cleaned}" 2>/dev/null; then
+                if run_as "${usr}" 10 /bin/bash -c \
+                    'umask 077; mkdir -p "$HOME/$1" && set -o noclobber && cat > "$HOME/$1/$2"' \
+                    _ "${USER_CONF_SUBDIR}" "${target}" < "${cleaned}"; then
+                    log "Moved edited ${entry} to ~${usr}/${USER_CONF_SUBDIR}/${target}"
+                else
+                    log "warning: could not move ${entry} to ~${usr}/${USER_CONF_SUBDIR}; removing it"
+                fi
             else
-                log "warning: could not move ${entry} to ~${usr}/${USER_CONF_SUBDIR}; removing it"
+                log "warning: could not rewrite ${entry}; removing it"
             fi
+            rm -f "${cleaned}"
         fi
         rm -f "${entry}"
         log "Removed user-owned ${entry}"
@@ -412,6 +497,12 @@ _reject_file() {
 
 _add_setting() {
     local key="$1" value="$2"
+    # Only reject % on values we actually copy; ignored keys (process_name,
+    # stdout_logfile, …) may still contain Supervisor expansions from old files.
+    if [[ "${value}" == *%* ]]; then
+        _reject_file "'%' is not allowed (in ${key}=)"
+        return 0
+    fi
     if [[ " ${prog_keys} " == *" ${key} "* ]]; then
         _reject_file "[program:${prog}] sets ${key} twice"
         return 0
@@ -551,12 +642,12 @@ render_user_conf() {
             _reject_file "${key}= appears before any [program:NAME] section"
             continue
         fi
-        if [[ "${value}" == *%* ]]; then
-            _reject_file "'%' is not allowed (in ${key}=)"
-            continue
-        fi
 
         case "${key}" in
+            # Always set by root when rendering — ignore even if they contain %.
+            user|process_name|redirect_stderr|stdout_*|stderr_*)
+                _note "note: ${key}= is set by the server and was ignored"
+                ;;
             command)
                 if [[ -z "${value}" ]] || ! shell_quotes_balanced "${value}"; then
                     _reject_file "command= is empty or has unbalanced quotes"
@@ -640,9 +731,6 @@ render_user_conf() {
                     continue
                 fi
                 _add_setting "${key}" "${value}"
-                ;;
-            user|process_name|redirect_stderr|stdout_*|stderr_*)
-                _note "note: ${key}= is set by the server and was ignored"
                 ;;
             *)
                 _note "note: ${key}= is not supported and was ignored"
